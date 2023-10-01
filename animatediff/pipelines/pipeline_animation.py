@@ -28,10 +28,54 @@ from diffusers.utils import deprecate, logging, BaseOutput
 from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
-
+from ..utils import slerp
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+
+
+#### This code is from animatediff prompt travel repo, originally in context.py but moved here for simplicity.
+# Used in uniform.
+def ordered_halving(val):
+    bin_str = f"{val:064b}"
+    bin_flip = bin_str[::-1]
+    as_int = int(bin_flip, 2)
+    return as_int / (1 << 64)
+
+# This takes some information about the denoising process and returns a list of integers corresponding to the indices of the frames we want to pull out.
+def uniform(
+    step: int = ...,
+    num_steps: Optional[int] = None,
+    num_frames: int = ...,
+    context_size: Optional[int] = None,
+    context_stride: int = 3,
+    context_overlap: int = 4,
+    closed_loop: bool = True,
+):
+    if num_frames <= context_size:
+        yield list(range(num_frames))
+        return
+
+    context_stride = min(context_stride, int(np.ceil(np.log2(num_frames / context_size))) + 1)
+
+    for context_step in 1 << np.arange(context_stride):
+        pad = int(round(num_frames * ordered_halving(step)))
+        for j in range(
+            int(ordered_halving(step) * context_step) + pad,
+            num_frames + pad + (0 if closed_loop else -context_overlap),
+            (context_size * context_step - context_overlap),
+        ):
+            yield [e % num_frames for e in range(j, j + context_size * context_step, context_step)]
+
+# Just returns uniform, since nothing else is implemented.
+def get_context_scheduler(name: str) -> Callable:
+    match name:
+        case "uniform":
+            return uniform
+        case _:
+            raise ValueError(f"Unknown context_overlap policy {name}")
+
+#### End of animatediff copied code.
 
 @dataclass
 class AnimationPipelineOutput(BaseOutput):
@@ -315,7 +359,7 @@ class AnimationPipeline(DiffusionPipeline):
     @torch.no_grad()
     def __call__(
         self,
-        prompt: Union[str, List[str]],
+        prompt: Optional[Union[str, List[str]]],
         video_length: Optional[int],
         height: Optional[int] = None,
         width: Optional[int] = None,
@@ -330,8 +374,24 @@ class AnimationPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        prompt_map: Optional[Union[str, List[str]]] = None,
+        context_frames: int = -1,
+        context_stride: int = 3,
+        context_overlap: int = 4,
         **kwargs,
     ):
+        assert context_frames > 0, "context_frames must be greater than 0" # need to set this to something other than -1 by hand; normally i'd make this mandatory arg but i do it like this to match how it's done in animatediff prompt travel repo
+        # TODO: turns out removing prompt would take a lot of work so we're going to keep it in and just not use it
+        # example prompt map:
+        # prompt_map = {
+        #     0: "A person is walking",
+        #     10: "A person is running",
+        #     20: "A person is jumping",
+        #     30: "A person is dancing",
+        # }
+        # # prompt map is for multi prompt generation
+        # assert prompt is None or prompt_map is None, "Only one of `prompt` and `prompt_map` can be set."
+
         # Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -361,6 +421,119 @@ class AnimationPipeline(DiffusionPipeline):
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
 
+        # we're just copying code mostly, out of https://github.com/s9roll7/animatediff-cli-prompt-travel/blob/f67dfdc138b93dce96e5e32d7b3e932d3ab7a3f5/src/animatediff/pipelines/animation.py#L64
+        # if using a prompt_map then we need to encode all the prompts
+        prompt_embeds_map = {}
+        prompt_map = dict(sorted(prompt_map.items()))
+        prompt_list = [prompt_map[key_frame] for key_frame in prompt_map.keys()]
+        # TODO: this _encode_prompt api has probably changed
+        prompt_embeds = self._encode_prompt(
+            prompt_list,
+            device,
+            num_videos_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            # clip_skip=clip_skip,
+        )
+        if do_classifier_free_guidance:
+            negative, positive = prompt_embeds.chunk(2, 0)
+            negative = negative.chunk(negative.shape[0], 0)
+            positive = positive.chunk(positive.shape[0], 0)
+        else:
+            positive = prompt_embeds
+            positive = positive.chunk(positive.shape[0], 0)
+        for i, key_frame in enumerate(prompt_map):
+            if do_classifier_free_guidance:
+                prompt_embeds_map[key_frame] = torch.cat([negative[i] , positive[i]])
+            else:
+                prompt_embeds_map[key_frame] = positive[i]
+        key_first =list(prompt_map.keys())[0]
+        key_last =list(prompt_map.keys())[-1]
+        def get_current_prompt_embeds_from_text(
+                center_frame = None,
+                video_length : int = 0
+                ):
+            # finds the nearest key frames (before and after) and just blends their prompt embeddings with slerp (sphere linear interpolation)
+
+            key_prev = key_last
+            key_next = key_first
+
+            for p in prompt_map.keys():
+                if p > center_frame:
+                    key_next = p
+                    break
+                key_prev = p
+
+            dist_prev = center_frame - key_prev
+            if dist_prev < 0:
+                dist_prev += video_length
+            dist_next = key_next - center_frame
+            if dist_next < 0:
+                dist_next += video_length
+
+            if key_prev == key_next or dist_prev + dist_next == 0:
+                return prompt_embeds_map[key_prev]
+
+            rate = dist_prev / (dist_prev + dist_next)
+
+            # TODO: there's also linear but we'll pick one for now
+            return slerp( prompt_embeds_map[key_prev], prompt_embeds_map[key_next], rate ) 
+
+        def get_current_prompt_embeds_multi(
+                context: List[int] = None,
+                video_length : int = 0
+                ):
+            # Takes list of frames to use for context and returns the prompt embeddings for those frames. Skipping image-based prompts for now.
+
+            # multi is because in the animatediff prompt travel repo, they have a multi prompt mode where they use multiple prompts and a single where there's a single prompt. But for prompt travel of course we're going to use multiple prompts.
+
+            neg = []
+            pos = []
+            for c in context:
+                t = get_current_prompt_embeds_from_text(c, video_length)
+                if do_classifier_free_guidance:
+                    negative, positive = t.chunk(2, 0)
+                    neg.append(negative)
+                    pos.append(positive)
+                else:
+                    pos.append(t)
+
+            if do_classifier_free_guidance:
+                neg = torch.cat(neg)
+                pos = torch.cat(pos)
+                text_emb = torch.cat([neg , pos])
+            else:
+                pos = torch.cat(pos)
+                text_emb = pos
+
+            # assert self.ip_adapter is None
+            return text_emb
+            # if self.ip_adapter == None:
+                # return text_emb
+
+            # neg = []
+            # pos = []
+            # for c in context:
+            #     im = get_current_prompt_embeds_from_image(c, video_length)
+            #     if do_classifier_free_guidance:
+            #         negative, positive = im.chunk(2, 0)
+            #         neg.append(negative)
+            #         pos.append(positive)
+            #     else:
+            #         pos.append(im)
+
+            # if do_classifier_free_guidance:
+            #     neg = torch.cat(neg)
+            #     pos = torch.cat(pos)
+            #     image_emb = torch.cat([neg , pos])
+            # else:
+            #     pos = torch.cat(pos)
+            #     image_emb = pos
+
+            # return torch.cat([text_emb,image_emb], dim=1)
+
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
@@ -373,37 +546,125 @@ class AnimationPipeline(DiffusionPipeline):
             video_length,
             height,
             width,
-            text_embeddings.dtype,
+            # text_embeddings.dtype,
+            prompt_embeds.dtype, # switched to prompt_embeds because we're doing multi prompt work now
             device,
             generator,
             latents,
         )
+        # latents shape: (batch_size * num_videos_per_prompt, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        # so we see latents.shape[2] a lot -- that's the video length
+
         latents_dtype = latents.dtype
 
         # Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         # Denoising loop
+        # The key difference between original animatediff and current animatediff is that the original one uses a single prompt and the current one uses multiple prompts. We have a context scheduler that pulls out the frames we want, so the noise prediction is kind of like a blend of the noise predictions for the different prompts.
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        context_scheduler = get_context_scheduler("uniform") # this is just hardcoded, from animatediff prompt travel repo
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
-                # noise_pred = []
-                # import pdb
-                # pdb.set_trace()
-                # for batch_idx in range(latent_model_input.shape[0]):
-                #     noise_pred_single = self.unet(latent_model_input[batch_idx:batch_idx+1], t, encoder_hidden_states=text_embeddings[batch_idx:batch_idx+1]).sample.to(dtype=latents_dtype)
-                #     noise_pred.append(noise_pred_single)
-                # noise_pred = torch.cat(noise_pred)
+                # unlike original animatediff code, we're accumulating the noise predictions for the different prompts instead of one-shotting it like in the commented out code: noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
+                noise_pred = torch.zeros(
+                    (latents.shape[0] * (2 if do_classifier_free_guidance else 1), *latents.shape[1:]),
+                    device=latents.device,
+                    dtype=latents.dtype,
+                )
+                # counter is to keep track of how many times we've added to the noise_pred, so we can average it later
+                counter = torch.zeros(
+                    (1, 1, latents.shape[2], 1, 1), device=latents.device, dtype=latents.dtype
+                )
+
+                # # predict the noise residual
+                # noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
+                # # noise_pred = []
+                # # import pdb
+                # # pdb.set_trace()
+                # # for batch_idx in range(latent_model_input.shape[0]):
+                # #     noise_pred_single = self.unet(latent_model_input[batch_idx:batch_idx+1], t, encoder_hidden_states=text_embeddings[batch_idx:batch_idx+1]).sample.to(dtype=latents_dtype)
+                # #     noise_pred.append(noise_pred_single)
+                # # noise_pred = torch.cat(noise_pred)
+
+                # this is the part that's different from the original animatediff code-- this is from animatediff prompt travel repo.
+                # We're pulling out the frames we want to use for context. Commenting out controlnet and reference stuff for now, which are image-based or similar ways of additional conditions.
+                for context in context_scheduler(
+                    i, num_inference_steps, latents.shape[2], context_frames, context_stride, context_overlap
+                ):
+                    # if controlnet_image_map:
+                        # controlnet_target = list(range(context[0]-context_frames, context[0])) + context + list(range(context[-1]+1, context[-1]+1+context_frames))
+                        # controlnet_target = [f%video_length for f in controlnet_target]
+                        # controlnet_target = list(set(controlnet_target))
+
+                        # process_controlnet(controlnet_target)
+
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = (
+                        latents[:, :, context]
+                        .to(device)
+                        .repeat(2 if do_classifier_free_guidance else 1, 1, 1, 1, 1)
+                    ) # remember, latents shape is (batch_size, num_channels_latents, video_length, height // self.vae_scale_factor, width // self.vae_scale_factor). So this pulls out the frames we want to use for context and then repeats them twice if we're doing classifier free guidance.
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                    # cur_prompt = get_current_prompt_embeds(context, latents.shape[2])
+                    cur_prompt = get_current_prompt_embeds_multi(context, latents.shape[2]) # the animatediff prompt travel repo has a single prompt mode and a multi prompt mode. We're using multi prompt mode here, so we just call the multi prompt function.
+
+                    # down_block_res_samples,mid_block_res_sample = get_controlnet_result(context)
+
+                    # if c_ref_enable:
+                    #     # ref only part
+                    #     noise = randn_tensor(
+                    #         ref_image_latents.shape, generator=generator, device=device, dtype=ref_image_latents.dtype
+                    #     )
+                    #     ref_xt = self.scheduler.add_noise(
+                    #         ref_image_latents,
+                    #         noise,
+                    #         t.reshape(
+                    #             1,
+                    #         ),
+                    #     )
+                    #     ref_xt = self.scheduler.scale_model_input(ref_xt, t)
+                    #     stopwatch_record("C_REF_MODE write start")
+                    #     C_REF_MODE = "write"
+                    #     self.unet(
+                    #         ref_xt,
+                    #         t,
+                    #         encoder_hidden_states=cur_prompt,
+                    #         cross_attention_kwargs=cross_attention_kwargs,
+                    #         return_dict=False,
+                    #     )
+                    #     stopwatch_record("C_REF_MODE write end")
+                    #     C_REF_MODE = "read"
+
+                    # predict the noise residual
+
+                    # stopwatch_record("normal unet start")
+                    pred = self.unet(
+                        latent_model_input.to(self.unet.device, self.unet.dtype),
+                        t,
+                        encoder_hidden_states=cur_prompt,
+                        # cross_attention_kwargs=cross_attention_kwargs,
+                        # down_block_additional_residuals=down_block_res_samples,
+                        # mid_block_additional_residual=mid_block_res_sample,
+                        return_dict=False,
+                    )[0] # only care about the commented out args for controlnet: cross_attention_kwargs, down_block_additional_residuals, mid_block_additional_residual
+
+                    # stopwatch_record("normal unet end")
+
+                    pred = pred.to(dtype=latents.dtype, device=latents.device)
+                    noise_pred[:, :, context] = noise_pred[:, :, context] + pred
+                    counter[:, :, context] = counter[:, :, context] + 1
+                    progress_bar.update()
 
                 # perform guidance
                 if do_classifier_free_guidance:
-                    noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                #     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                    noise_pred_uncond, noise_pred_text = (noise_pred / counter).chunk(2)
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
                 # compute the previous noisy sample x_t -> x_t-1
