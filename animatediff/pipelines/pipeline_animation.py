@@ -1,7 +1,7 @@
 # Adapted from https://github.com/showlab/Tune-A-Video/blob/main/tuneavideo/pipelines/pipeline_tuneavideo.py
 
 import inspect
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,10 +28,9 @@ from diffusers.utils import deprecate, logging, BaseOutput
 from einops import rearrange
 
 from ..models.unet import UNet3DConditionModel
-from ..utils import slerp
+from ..utils.util import slerp
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
-
 
 
 #### This code is from animatediff prompt travel repo, originally in context.py but moved here for simplicity.
@@ -374,7 +373,7 @@ class AnimationPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
-        prompt_map: Optional[Union[str, List[str]]] = None,
+        prompt_map: Dict[int, str] = None,
         context_frames: int = -1,
         context_stride: int = 3,
         context_overlap: int = 4,
