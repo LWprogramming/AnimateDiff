@@ -24,6 +24,7 @@ from diffusers.schedulers import (
     PNDMScheduler,
 )
 from diffusers.utils import deprecate, logging, BaseOutput
+from diffusers.loaders import TextualInversionLoaderMixin
 
 from einops import rearrange
 
@@ -207,94 +208,177 @@ class AnimationPipeline(DiffusionPipeline):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
-    def _encode_prompt(self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
-        batch_size = len(prompt) if isinstance(prompt, list) else 1
+    # def _encode_prompt(self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
+    #     batch_size = len(prompt) if isinstance(prompt, list) else 1
 
-        text_inputs = self.tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=self.tokenizer.model_max_length,
-            truncation=True,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids
-        untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+    #     text_inputs = self.tokenizer(
+    #         prompt,
+    #         padding="max_length",
+    #         max_length=self.tokenizer.model_max_length,
+    #         truncation=True,
+    #         return_tensors="pt",
+    #     )
+    #     text_input_ids = text_inputs.input_ids
+    #     untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
-        if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
-            removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
-            logger.warning(
-                "The following part of your input was truncated because CLIP can only handle sequences up to"
-                f" {self.tokenizer.model_max_length} tokens: {removed_text}"
-            )
+    #     if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+    #         removed_text = self.tokenizer.batch_decode(untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1])
+    #         logger.warning(
+    #             "The following part of your input was truncated because CLIP can only handle sequences up to"
+    #             f" {self.tokenizer.model_max_length} tokens: {removed_text}"
+    #         )
 
-        if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-            attention_mask = text_inputs.attention_mask.to(device)
+    #     if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+    #         attention_mask = text_inputs.attention_mask.to(device)
+    #     else:
+    #         attention_mask = None
+
+    #     text_embeddings = self.text_encoder(
+    #         text_input_ids.to(device),
+    #         attention_mask=attention_mask,
+    #     )
+    #     text_embeddings = text_embeddings[0]
+
+    #     # duplicate text embeddings for each generation per prompt, using mps friendly method
+    #     bs_embed, seq_len, _ = text_embeddings.shape
+    #     text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1)
+    #     text_embeddings = text_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
+
+    #     # get unconditional embeddings for classifier free guidance
+    #     if do_classifier_free_guidance:
+    #         uncond_tokens: List[str]
+    #         if negative_prompt is None:
+    #             uncond_tokens = [""] * batch_size
+    #         elif type(prompt) is not type(negative_prompt):
+    #             raise TypeError(
+    #                 f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
+    #                 f" {type(prompt)}."
+    #             )
+    #         elif isinstance(negative_prompt, str):
+    #             uncond_tokens = [negative_prompt]
+    #         elif batch_size != len(negative_prompt):
+    #             raise ValueError(
+    #                 f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
+    #                 f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
+    #                 " the batch size of `prompt`."
+    #             )
+    #         else:
+    #             uncond_tokens = negative_prompt
+
+    #         max_length = text_input_ids.shape[-1]
+    #         uncond_input = self.tokenizer(
+    #             uncond_tokens,
+    #             padding="max_length",
+    #             max_length=max_length,
+    #             truncation=True,
+    #             return_tensors="pt",
+    #         )
+
+    #         if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+    #             attention_mask = uncond_input.attention_mask.to(device)
+    #         else:
+    #             attention_mask = None
+
+    #         uncond_embeddings = self.text_encoder(
+    #             uncond_input.input_ids.to(device),
+    #             attention_mask=attention_mask,
+    #         )
+    #         uncond_embeddings = uncond_embeddings[0]
+
+    #         # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+    #         seq_len = uncond_embeddings.shape[1]
+    #         uncond_embeddings = uncond_embeddings.repeat(1, num_videos_per_prompt, 1)
+    #         uncond_embeddings = uncond_embeddings.view(batch_size * num_videos_per_prompt, seq_len, -1)
+
+    #         # For classifier free guidance, we need to do two forward passes.
+    #         # Here we concatenate the unconditional and text embeddings into a single batch
+    #         # to avoid doing two forward passes
+    #         text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
+
+    #     return text_embeddings
+
+    # I don't really understand what this is doing, but this is overwriting the original AnimateDiff repo's _encode_prompt method. I copy-pasted this directly from the prompt-travel repo: https://github.com/s9roll7/animatediff-cli-prompt-travel/blob/f67dfdc138b93dce96e5e32d7b3e932d3ab7a3f5/src/animatediff/pipelines/animation.py#L247, although things aren't super clear based on issue https://github.com/s9roll7/animatediff-cli-prompt-travel/issues/83.
+    # I also had to download utils/lpw_stable_diffusion.py from the prompt-travel repo and the models/clip.py file to make things work because there's a pile of code to add there.
+    def _encode_prompt(
+        self,
+        prompt,
+        device,
+        num_videos_per_prompt: int = 1,
+        do_classifier_free_guidance: bool = False,
+        negative_prompt=None,
+        max_embeddings_multiples=3,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        clip_skip: int = 1,
+    ):
+        r"""
+        Encodes the prompt into text encoder hidden states.
+
+        Args:
+            prompt (`str` or `list(int)`):
+                prompt to be encoded
+            device: (`torch.device`):
+                torch device
+            num_videos_per_prompt (`int`):
+                number of videos that should be generated per prompt
+            do_classifier_free_guidance (`bool`):
+                whether to use classifier free guidance or not
+            negative_prompt (`str` or `List[str]`):
+                The prompt or prompts not to guide the image generation. Ignored when not using guidance (i.e., ignored
+                if `guidance_scale` is less than `1`).
+            max_embeddings_multiples (`int`, *optional*, defaults to `3`):
+                The max multiple length of prompt embeddings compared to the max output length of text encoder.
+        """
+        from ..utils.lpw_stable_diffusion import get_weighted_text_embeddings
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
         else:
-            attention_mask = None
+            batch_size = prompt_embeds.shape[0]
 
-        text_embeddings = self.text_encoder(
-            text_input_ids.to(device),
-            attention_mask=attention_mask,
-        )
-        text_embeddings = text_embeddings[0]
-
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
-        bs_embed, seq_len, _ = text_embeddings.shape
-        text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1)
-        text_embeddings = text_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
-
-        # get unconditional embeddings for classifier free guidance
-        if do_classifier_free_guidance:
-            uncond_tokens: List[str]
+        if negative_prompt_embeds is None:
             if negative_prompt is None:
-                uncond_tokens = [""] * batch_size
-            elif type(prompt) is not type(negative_prompt):
-                raise TypeError(
-                    f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-                    f" {type(prompt)}."
-                )
+                negative_prompt = [""] * batch_size
             elif isinstance(negative_prompt, str):
-                uncond_tokens = [negative_prompt]
-            elif batch_size != len(negative_prompt):
+                negative_prompt = [negative_prompt] * batch_size
+            if batch_size != len(negative_prompt):
                 raise ValueError(
                     f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
                     f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
                     " the batch size of `prompt`."
                 )
-            else:
-                uncond_tokens = negative_prompt
+        if prompt_embeds is None or negative_prompt_embeds is None:
+            if isinstance(self, TextualInversionLoaderMixin):
+                prompt = self.maybe_convert_prompt(prompt, self.tokenizer)
+                if do_classifier_free_guidance and negative_prompt_embeds is None:
+                    negative_prompt = self.maybe_convert_prompt(negative_prompt, self.tokenizer)
 
-            max_length = text_input_ids.shape[-1]
-            uncond_input = self.tokenizer(
-                uncond_tokens,
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
-                return_tensors="pt",
+            prompt_embeds1, negative_prompt_embeds1 = get_weighted_text_embeddings(
+                pipe=self,
+                prompt=prompt,
+                uncond_prompt=negative_prompt if do_classifier_free_guidance else None,
+                max_embeddings_multiples=max_embeddings_multiples,
+                clip_skip=clip_skip
             )
+            if prompt_embeds is None:
+                prompt_embeds = prompt_embeds1
+            if negative_prompt_embeds is None:
+                negative_prompt_embeds = negative_prompt_embeds1
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
-                attention_mask = uncond_input.attention_mask.to(device)
-            else:
-                attention_mask = None
+        bs_embed, seq_len, _ = prompt_embeds.shape
+        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+        prompt_embeds = prompt_embeds.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
-            uncond_embeddings = self.text_encoder(
-                uncond_input.input_ids.to(device),
-                attention_mask=attention_mask,
-            )
-            uncond_embeddings = uncond_embeddings[0]
+        if do_classifier_free_guidance:
+            bs_embed, seq_len, _ = negative_prompt_embeds.shape
+            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+            negative_prompt_embeds = negative_prompt_embeds.view(bs_embed * num_videos_per_prompt, seq_len, -1)
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
-            seq_len = uncond_embeddings.shape[1]
-            uncond_embeddings = uncond_embeddings.repeat(1, num_videos_per_prompt, 1)
-            uncond_embeddings = uncond_embeddings.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
-            # For classifier free guidance, we need to do two forward passes.
-            # Here we concatenate the unconditional and text embeddings into a single batch
-            # to avoid doing two forward passes
-            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
-
-        return text_embeddings
+        return prompt_embeds
 
     def decode_latents(self, latents):
         video_length = latents.shape[2]
@@ -433,9 +517,9 @@ class AnimationPipeline(DiffusionPipeline):
         prompt = prompt if isinstance(prompt, list) else [prompt] * batch_size
         if negative_prompt is not None:
             negative_prompt = negative_prompt if isinstance(negative_prompt, list) else [negative_prompt] * batch_size 
-        text_embeddings = self._encode_prompt(
-            prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
-        )
+        # text_embeddings = self._encode_prompt(
+        #     prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
+        # )
 
         # we're just copying code mostly, out of https://github.com/s9roll7/animatediff-cli-prompt-travel/blob/f67dfdc138b93dce96e5e32d7b3e932d3ab7a3f5/src/animatediff/pipelines/animation.py#L64
         # if using a prompt_map then we need to encode all the prompts
