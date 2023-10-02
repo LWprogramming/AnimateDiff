@@ -25,3 +25,4 @@ models/StableDiffusion/*
 !models/MotionLoRA/*.txt
 
 .venv/
+**/.DS_Store
